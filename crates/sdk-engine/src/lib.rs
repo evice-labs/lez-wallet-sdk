@@ -14,7 +14,6 @@ pub mod request;
 pub mod resolve;
 pub mod session;
 pub mod store;
-pub mod token_facade;
 pub mod verifier;
 
 // Re-export core types that consumers use constantly.

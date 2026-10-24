@@ -1,4 +1,4 @@
-//! Program instruction decoders .
+//! Program instruction decoders.
 //!
 //! Each decoder converts raw program calldata into a human-readable
 //! [`DecodedInstruction`]. The [`DecoderRegistry`] dispatches to the
@@ -56,7 +56,8 @@ impl DecoderRegistry {
     /// decoder's result or a raw fallback.
     pub fn decode(&self, program_id: &AccountId, data: &[u8]) -> DecodedInstruction {
         for decoder in &self.decoders {
-            if decoder.program_ids().contains(program_id)
+            let ids = decoder.program_ids();
+            if (ids.is_empty() || ids.contains(program_id))
                 && let Some(decoded) = decoder.decode(program_id, data)
             {
                 return decoded;

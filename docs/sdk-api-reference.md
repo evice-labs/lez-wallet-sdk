@@ -204,16 +204,31 @@ Monitors or cancels the lifecycle of an immutable request proposal.
 ```
 
 ### 3.9 `resolve_name`
-Resolves a `.lez` domain name using the clean-room Logos Name Service (LNS) client.
-- **FFI Signature:** `lez_wallet_resolve_name(engine: *mut FfiSdkEngine, name: *const c_char) -> *mut c_char`
+Resolves a human-readable `.lez` domain name using the clean-room Logos Name Service (LNS) client against live on-chain registry state.
+- **FFI Signature:** `lez_wallet_resolve_name(engine: *mut FfiSdkEngine, session_id: *const c_char, name: *const c_char) -> *mut c_char`
+- **Parameters:**
+  - `session_id`: Active authorized session identifier.
+  - `name`: Target `.lez` domain name (e.g. `"alice.lez"` or `"jef.lez"`).
+- **Resolution Protocol (SPEC.md):**
+  1. **Normalisation:** Trims whitespace, lowers ASCII case, verifies `[a-z0-9-]{1,32}` without leading/trailing hyphens.
+  2. **Key Derivation:** Computes `Argon2id(name, "logos-names/v5", 64MiB, 3, 1)` -> `id` (`SHA-256("logos-names/v5/id" || master)`) and `key` (`SHA-256("logos-names/v5/key" || master)`).
+  3. **PDA Calculation:** Derives `seed = SHA-256("logos-names/v5/name/" || id)` and public PDA `SHA-256(pad32("/LEE/v0.2/AccountId/PDA/") || registry || seed)`.
+  4. **State Query:** Fetches on-chain account state from LEZ Sequencer JSON-RPC (`getAccount`), extracting the registry shard.
+  5. **Borsh Decoding & Expiry:** Decodes `NameRecord` and checks expiration (epoch ms; deposit v5 never lapses, active terms checked against 30-day grace period of 2,592,000,000 ms).
+  6. **AES-256-GCM Decryption:** Opens sealed profile payload with 12-byte nonce, 16-byte authentication tag, and Associated Data `b"logos-names/v5/record"`.
+  7. **Profile Deserialization:** Decodes Borsh `Profile` (ignoring zero-padding bytes) and verifies `profile.name == input_name`.
 - **Response Format:**
 ```json
 {
   "ok": true,
-  "name": "alice.lez",
-  "account_id": "44KVvzvh2ephQU9aR5snboGUXKgS1FnPYh1W4KZKwmhm",
-  "owner_account_id": "478hD6LXFTYu5gRRkWkCyXPRsWgCwAfRredoCUfxr5b9",
-  "expires_at": 1893456000
+  "name": "alice",
+  "account": "44KVvzvh2ephQU9aR5snboGUXKgS1FnPYh1W4KZKwmhm",
+  "npk": null,
+  "vpk": null,
+  "expires": 1893456000000,
+  "texts": [
+    ["chat", "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"]
+  ]
 }
 ```
 

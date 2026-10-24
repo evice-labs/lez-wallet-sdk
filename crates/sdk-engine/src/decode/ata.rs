@@ -1,13 +1,18 @@
 use super::{DecodedInstruction, ProgramDecoder};
+use borsh::BorshDeserialize;
 use lee::AccountId;
 
 pub struct AtaDecoder;
 
-// TODO: Implement actual decoding from program instruction bytes.
-// For now, stub that returns None so the registry falls through to raw display.
+#[derive(Debug, Clone, BorshDeserialize)]
+enum HoldingMessage {
+    Initialize {
+        definition: [u8; 32],
+        owner: [u8; 32],
+    },
+}
 
 impl AtaDecoder {
-    #[allow(dead_code)]
     pub fn name() -> &'static str {
         "ata"
     }
@@ -15,12 +20,24 @@ impl AtaDecoder {
 
 impl ProgramDecoder for AtaDecoder {
     fn program_ids(&self) -> Vec<AccountId> {
-        // TODO: Return the actual program id(s) for ata.
         vec![]
     }
 
-    fn decode(&self, _program_id: &AccountId, _data: &[u8]) -> Option<DecodedInstruction> {
-        // TODO: Implement real decoding.
-        None
+    fn decode(&self, program_id: &AccountId, data: &[u8]) -> Option<DecodedInstruction> {
+        if let Ok(msg) = HoldingMessage::try_from_slice(data) {
+            match msg {
+                HoldingMessage::Initialize { definition, owner } => Some(DecodedInstruction {
+                    program: hex::encode(program_id.to_bytes()),
+                    operation: "InitializeHolding".into(),
+                    fields: vec![
+                        ("Definition".into(), hex::encode(definition)),
+                        ("Owner".into(), hex::encode(owner)),
+                    ],
+                    raw: data.to_vec(),
+                }),
+            }
+        } else {
+            None
+        }
     }
 }

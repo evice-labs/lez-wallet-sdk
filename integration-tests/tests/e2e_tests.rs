@@ -76,6 +76,19 @@ async fn test_wallet_lifecycle_and_account_derivation() {
     let err = engine.create_account_public(None).await;
     assert!(err.is_err());
 
+    // Security check: Unlock wallet with WRONG password must fail with InvalidPassword
+    let bad_unlock = engine.unlock("wrong_password_xyz").await;
+    assert!(
+        matches!(
+            bad_unlock,
+            Err(sdk_engine::error::SdkError::InvalidPassword)
+        ),
+        "unlock with wrong password must return InvalidPassword error, got: {:?}",
+        bad_unlock
+    );
+    let still_locked_info = engine.sdk_info().await.expect("failed to get sdk info");
+    assert!(still_locked_info.wallet_locked);
+
     // Unlock wallet with correct password
     engine
         .unlock("testpass_master_123")
@@ -375,4 +388,247 @@ fn test_ffi_c_abi_end_to_end_lifecycle() {
 
     // Free engine
     unsafe { lez_wallet_engine_free(engine) };
+}
+
+#[tokio::test]
+async fn test_security_flaws_and_access_control() {
+    let env = TestEnv::new();
+    let handler = Arc::new(MockApprovalHandler::new(ApprovalDecision::Approve));
+    let engine = SdkEngine::open_or_init(
+        env.data_dir.clone(),
+        "correct_master_pass_123",
+        handler.clone(),
+    )
+    .expect("failed to initialize wallet engine");
+
+    let _mnemonic = engine
+        .create_wallet("correct_master_pass_123")
+        .await
+        .expect("failed to create wallet");
+
+    let alice = engine
+        .create_account_public(Some("Alice Safe".to_string()))
+        .await
+        .expect("failed to derive alice");
+    let bob = engine
+        .create_account_public(Some("Bob Safe".to_string()))
+        .await
+        .expect("failed to derive bob");
+
+    // 1. Password Verification Security
+    engine.lock().await.expect("failed to lock");
+
+    // Test multiple wrong password permutations
+    for bad_pwd in &[
+        "",
+        "wrong",
+        "correct_master_pass",
+        "correct_master_pass_1234",
+    ] {
+        let res = engine.unlock(bad_pwd).await;
+        assert!(
+            matches!(res, Err(sdk_engine::error::SdkError::InvalidPassword)),
+            "unlock with '{}' must return InvalidPassword, got {:?}",
+            bad_pwd,
+            res
+        );
+        let info = engine.sdk_info().await.expect("info");
+        assert!(
+            info.wallet_locked,
+            "wallet must remain locked after failed attempt"
+        );
+    }
+
+    // Unlock with correct password
+    engine
+        .unlock("correct_master_pass_123")
+        .await
+        .expect("unlock with correct password must succeed");
+
+    // 2. Granular Grant Boundary & Privilege Escalation Protection
+    let session_id = engine
+        .connect("untrusted_dapp.lez".to_string(), 1)
+        .await
+        .expect("connect dApp");
+
+    // Attempt calling identity API without grant -> must fail
+    let id_err = engine.get_identity_commitment(&session_id).await;
+    assert!(matches!(
+        id_err,
+        Err(sdk_engine::error::SdkError::InsufficientGrant)
+    ));
+
+    let null_err = engine.derive_scoped_nullifier(&session_id, "scope_a").await;
+    assert!(matches!(
+        null_err,
+        Err(sdk_engine::error::SdkError::InsufficientGrant)
+    ));
+
+    // Attempt signing attestation with only IdentityRead -> must fail (requires IdentityPropose)
+    engine
+        .request_identity_access(&session_id, GrantKind::IdentityRead)
+        .await
+        .expect("grant IdentityRead");
+    let sign_err = engine
+        .sign_identity_attestation(&session_id, "scope_a", b"malicious_message")
+        .await;
+    assert!(matches!(
+        sign_err,
+        Err(sdk_engine::error::SdkError::InsufficientGrant)
+    ));
+
+    // 3. Program Verification & Transaction Inspection
+    engine
+        .grant_account(&session_id, alice, GrantKind::Propose)
+        .await
+        .expect("grant propose");
+
+    let req_id = engine
+        .propose_native_transfer(&session_id, alice, bob.to_string(), 250)
+        .await
+        .expect("propose native transfer");
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // Verify approval prompt carries verification status
+    let prompts = handler.recorded_prompts().await;
+    assert!(!prompts.is_empty());
+    let last_prompt = prompts.last().unwrap();
+    assert!(
+        last_prompt
+            .verification_status
+            .as_deref()
+            .unwrap_or_default()
+            .contains("Verified"),
+        "Native token transfer must be recognized as Verified, got: {:?}",
+        last_prompt.verification_status
+    );
+
+    // Verify request ID matches
+    assert_eq!(last_prompt.request.id, req_id);
+
+    // 4. Session Revocation Security
+    engine
+        .revoke_session(&session_id)
+        .await
+        .expect("revoke session");
+
+    // Post-revocation access is completely blocked
+    let post_rev_bal = engine.get_balance(&session_id, &alice).await;
+    assert!(matches!(
+        post_rev_bal,
+        Err(sdk_engine::error::SdkError::SessionNotFound(_))
+    ));
+}
+
+#[tokio::test]
+async fn test_lns_name_resolution_and_ffi_safety() {
+    let env = TestEnv::new();
+    let handler = Arc::new(MockApprovalHandler::new(ApprovalDecision::Approve));
+    let engine = SdkEngine::open_or_init(env.data_dir.clone(), "testpass_lns_123", handler)
+        .expect("failed to initialize wallet engine");
+
+    let alice = engine
+        .create_account_public(Some("Alice".to_string()))
+        .await
+        .expect("create alice");
+
+    let session_id = engine
+        .connect("test_resolver.lez".to_string(), 1)
+        .await
+        .expect("connect");
+
+    // 1. Invalid Name Format Rejections (SPEC §2)
+    let invalid_names = [
+        "-leading-hyphen.lez",
+        "trailing-hyphen-.lez",
+        ".lez",
+        "has space.lez",
+        "UPPER!.lez",
+    ];
+    for invalid in &invalid_names {
+        let res = engine.resolve_name(&session_id, invalid).await;
+        assert!(res.is_err(), "Invalid name '{}' must be rejected", invalid);
+    }
+
+    // Bare name without .lez passed to resolve_name directly must return InvalidArgument
+    let bare_res = engine.resolve_name(&session_id, "bob").await;
+    assert!(
+        matches!(
+            bare_res,
+            Err(sdk_engine::error::SdkError::InvalidArgument(_))
+        ),
+        "Bare name without .lez must return InvalidArgument"
+    );
+
+    // Unregistered name on testnet must return NameResolutionError
+    let unreg_res = engine
+        .resolve_name(&session_id, "definitely-unregistered-xyz999.lez")
+        .await;
+    assert!(
+        matches!(
+            unreg_res,
+            Err(sdk_engine::error::SdkError::NameResolutionError(_))
+        ),
+        "Unregistered name must return NameResolutionError"
+    );
+
+    // 2. Transfer to Unregistered LNS Name Must Be Rejected Before Transaction Creation
+    engine
+        .grant_account(&session_id, alice, GrantKind::Propose)
+        .await
+        .expect("grant propose");
+
+    let transfer_unreg = engine
+        .propose_native_transfer(
+            &session_id,
+            alice,
+            "definitely-unregistered-xyz999.lez".to_string(),
+            100,
+        )
+        .await;
+    assert!(
+        matches!(
+            transfer_unreg,
+            Err(sdk_engine::error::SdkError::NameResolutionError(_))
+        ),
+        "Transfer to unregistered .lez name must fail without proposing a transaction"
+    );
+}
+
+#[test]
+fn test_lns_ffi_c_abi_safety() {
+    let ffi_env = TestEnv::new();
+    let path_str = CString::new(ffi_env.data_dir.to_str().unwrap()).unwrap();
+    let ffi_engine = unsafe { lez_wallet_engine_new(path_str.as_ptr()) };
+    assert!(!ffi_engine.is_null());
+
+    let name = CString::new("alice.lez").unwrap();
+    let sess = CString::new("mock_session_id").unwrap();
+
+    // 1. Null engine pointer safety
+    let null_ptr_res =
+        unsafe { lez_wallet_resolve_name(std::ptr::null_mut(), sess.as_ptr(), name.as_ptr()) };
+    let null_res_str = unsafe { CStr::from_ptr(null_ptr_res) }.to_str().unwrap();
+    let null_res_json: serde_json::Value = serde_json::from_str(null_res_str).unwrap();
+    assert_eq!(null_res_json["ok"], false);
+    assert_eq!(null_res_json["error"], "Null engine handle");
+    unsafe { lez_wallet_free_string(null_ptr_res) };
+
+    // 2. Null parameter pointers safety
+    let null_param_res =
+        unsafe { lez_wallet_resolve_name(ffi_engine, std::ptr::null(), name.as_ptr()) };
+    let null_param_str = unsafe { CStr::from_ptr(null_param_res) }.to_str().unwrap();
+    let null_param_json: serde_json::Value = serde_json::from_str(null_param_str).unwrap();
+    assert_eq!(null_param_json["ok"], false);
+    unsafe { lez_wallet_free_string(null_param_res) };
+
+    // 3. Invalid/unauthorized session call safety
+    let uninit_res = unsafe { lez_wallet_resolve_name(ffi_engine, sess.as_ptr(), name.as_ptr()) };
+    let uninit_str = unsafe { CStr::from_ptr(uninit_res) }.to_str().unwrap();
+    let uninit_json: serde_json::Value = serde_json::from_str(uninit_str).unwrap();
+    assert_eq!(uninit_json["ok"], false);
+    unsafe { lez_wallet_free_string(uninit_res) };
+
+    unsafe { lez_wallet_engine_free(ffi_engine) };
 }

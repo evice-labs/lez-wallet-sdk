@@ -43,6 +43,8 @@ pub enum SdkError {
     AccountNotFound(String),
     #[error("recipient account not initialized for this token")]
     RecipientNotInitialized,
+    #[error("incorrect password — cannot unlock wallet")]
+    InvalidPassword,
 
     // Name resolution errors
     #[error("name not found: {0}")]

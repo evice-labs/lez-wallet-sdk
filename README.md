@@ -10,7 +10,7 @@ It solves the core challenges of asset custody, dApp communication, and transact
 - **Full LEZ Asset & Account Management:** Unified handling of native and token-program assets across both public and private (shielded) accounts.
 - **Wallet Provider SDK:** Robust, asynchronous dApp-facing API enabling external applications to connect, request account access, read balances, and propose transactions.
 - **Informed Consent & Approval UX:** Every transaction proposal produces human-readable instruction summaries, simulated balance/state diffs, and bytecode source verification status before signing.
-- **Privacy-Preserving Name Resolution:** Built-in clean-room resolver for human-readable `.lez` names (Logos Name Service) using off-chain Argon2id key derivation and on-chain PDA lookups.
+- **Privacy-Preserving Name Resolution:** Built-in clean-room resolver for human-readable `.lez` names (Logos Name Service, SPEC.md) using off-chain Argon2id key derivation, live on-chain sequencer PDA lookups, and AES-256-GCM sealed profile decryption.
 - **Client-Side Identity Accountability:** Native accountable pseudonymity featuring master identity commitments, cross-dApp unlinkable scoped nullifiers, BIP-340 Schnorr attestations, and Two-Tier Shamir Secret Sharing (SSS).
 - **Decoupled Three-Layer Architecture:** Pure Rust core logic (`sdk-engine`) with zero GUI dependencies, accessible via C-ABI (`sdk-ffi`) for Logos Basecamp modules and via CLI.
 
@@ -85,8 +85,10 @@ lez-wallet-sdk/
 - Displays `VerificationStatus::Verified`, `NotVerified`, or `NotChecked` alongside compiler and source repository metadata.
 
 #### 6. Clean-Room LNS Resolver (`resolve/lns.rs`)
-- Full, independent implementation of SPEC.md for `.lez` domain resolution.
-- Normalises names (`[a-z0-9-]{1,32}`), derives master keys via Argon2id (64 MiB, 3 passes), and calculates PDA seeds without depending on external binaries.
+- Full, independent implementation of [SPEC.md](https://github.com/jefdiesel/logos-names/blob/main/SPEC.md) for `.lez` domain resolution.
+- Normalises names (`[a-z0-9-]{1,32}`), derives master keys via Argon2id (64 MiB, 3 passes, salt `"logos-names/v5"`), and computes on-chain PDA account addresses (`SHA-256(pad32("/LEE/v0.2/AccountId/PDA/") || program || seed)`).
+- Live on-chain resolution via LEZ Sequencer JSON-RPC (`getAccount`), decoding Borsh `NameRecord` state and validating millisecond timestamps against 30-day grace periods.
+- AES-256-GCM sealed profile decryption bound to associated data `logos-names/v5/record`, deserializing Borsh `Profile` records (with zero-padding tolerance) and verifying `profile.name == input_name`.
 - In-memory cache with 5-minute TTL, cleared automatically upon wallet lock.
 - User-controllable toggle (`lns_enabled`) with graceful fallback to raw 32-byte account IDs.
 
@@ -147,7 +149,7 @@ cd lez-wallet-sdk
 
 # Using Just task runner
 just build            # Compile all workspace crates
-just test             # Run full test suite (all 30 tests across engine, ffi, and integration-tests)
+just test             # Run full test suite (all 50 tests across engine, ffi, and integration-tests)
 just lint             # Check clippy lints with warnings as errors
 just header           # Generate C/C++ FFI header via cbindgen
 
@@ -270,7 +272,7 @@ Automated GitHub Actions workflows are configured in `.github/workflows/`:
 
 ## Acknowledgments & Attribution
 
-- **Logos Name Service (LNS):** We gratefully acknowledge **Jef** ([@jefdiesel](https://github.com/jefdiesel)) for designing and publishing the open protocol specification for the Logos Name Service ([SPEC.md](https://github.com/jefdiesel/logos-names/blob/main/SPEC.md)) on the Logos Execution Zone. This SDK includes an independent, clean-room Rust implementation of the client-side name resolution protocol (`sdk-engine::resolve::lns`).
+- **Logos Name Service (LNS):** We gratefully acknowledge **Jef** ([@jefdiesel](https://github.com/jefdiesel)) for designing and publishing the open protocol specification for the Logos Name Service ([SPEC.md](https://github.com/jefdiesel/logos-names/blob/main/SPEC.md)) on the Logos Execution Zone. This SDK includes an independent, clean-room Rust implementation of the client-side name resolution protocol.
 - **Identity Accountability Architecture:** The accountable pseudonymity model, deterministic identity commitments, and threshold accountability primitives are designed by **Evice Labs**, adapted from the [`e-identity-stack`](https://github.com/evice-labs/e-identity-stack) repository for native integration into the Logos Execution Zone.
 
 ## License

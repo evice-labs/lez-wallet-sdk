@@ -1,6 +1,6 @@
 # System Architecture & Technical Specification
 
-> **Evice Wallet SDK (by Evice Labs)**  
+> **Evice Wallet & Provider SDK for Logos Execution Zone**  
 > Modular, headless Wallet Engine and dApp Provider SDK for the Logos Execution Zone (LEZ).  
 > Designed to provide a high-security, ergonomic wallet infrastructure and provider engine for the Logos Execution Zone.
 
@@ -245,33 +245,49 @@ Aligning with reproducible smart contract source verification standards, the app
 
 ### 4.7 Clean-Room Logos Name Service (LNS) Resolver (`resolve/lns.rs`)
 
-The SDK incorporates an independent, clean-room implementation of the Logos Name Service ([`SPEC.md`](https://github.com/jefdiesel/logos-names/blob/main/SPEC.md)) for human-readable `.lez` names:
+The SDK incorporates a complete, independent, clean-room implementation of the Logos Name Service ([`SPEC.md`](https://github.com/jefdiesel/logos-names/blob/main/SPEC.md)) for human-readable `.lez` names, performing live on-chain lookups and authenticated AES-256-GCM profile decryption:
 
 ```
 Input Name: "alice.lez"
       │
-      ▼ (Phase 1: Normalisation)
-Validate & lowercase: [a-z0-9-]{1,32}
+      ▼ (Phase 1: Normalisation — SPEC §2)
+Trim whitespace, lowercase ASCII, strip ".lez": [a-z0-9-]{1,32}
       │
-      ▼ (Phase 2: Key Derivation)
-Argon2id(password="alice", salt="logos-names/v5/salt", mem=64MiB, passes=3)
+      ▼ (Phase 2: Memory-Hard Key Derivation — SPEC §3)
+Argon2id(password="alice", salt="logos-names/v5", mem=64MiB, passes=3, lanes=1)
       │
       ▼
 Master Secret [u8; 32]
-      ├──► Name ID  = SHA-256("logos-names/v5/id"  ‖ Master)
-      └──► Decr Key = SHA-256("logos-names/v5/key" ‖ Master)
+      ├──► Name ID  = SHA-256("logos-names/v5/id"  ‖ Master)   (Public identifier)
+      └──► Decr Key = SHA-256("logos-names/v5/key" ‖ Master)   (Private decryption key)
       │
-      ▼ (Phase 3: PDA Calculation)
-PDA Seed = SHA-256("logos-names/v5/pda" ‖ Name ID)
+      ▼ (Phase 3: On-Chain PDA Derivation — SPEC §4)
+PDA Seed   = SHA-256("logos-names/v5/name/" ‖ Name ID)
+Record PDA = SHA-256(pad32("/LEE/v0.2/AccountId/PDA/") ‖ Registry_Program_ID ‖ PDA Seed)
       │
-      ▼ (Phase 4: Resolution & Cache)
-Check In-Memory Cache (TTL = 300s) ──► Cache Hit: Return cached AccountId
+      ▼ (Phase 4: Resolution & Verification — SPEC §5, §6)
+Check In-Memory Cache (TTL = 300s) ──► Cache Hit: Return cached ResolvedDestination
       │ (Cache Miss)
-Query Sequencer PDA State ──► Return resolved AccountId
+Query Sequencer RPC `getAccount(Record PDA)`
+      │
+      ├──► Account / Shard Absent ──► Return ResolveError::NameNotFound
+      │
+      ▼ (Extract Registry Shard)
+Decode NameRecord (Borsh) ──► Verify Expiry (Epoch ms; Grace Period = 2,592,000,000 ms)
+      │
+      ▼ (Decrypt Sealed Profile)
+AES-256-GCM Decrypt(Decr Key, Nonce=12B, Tag=16B, AAD=b"logos-names/v5/record")
+      │
+      ▼ (Decode Plaintext Profile)
+Decode Profile (Borsh, zero-padding tolerant) ──► Verify profile.name == input name
+      │
+      ▼
+Cache in DashMap & Return ResolvedDestination { name, account, npk, vpk, expires, texts }
 ```
 
-- **Cache Invalidation:** The in-memory cache maintains a 5-minute TTL (`DEFAULT_CACHE_TTL`). When the wallet is locked, the cache is completely purged to ensure zero address retention in memory.
+- **Cache Invalidation:** The in-memory cache maintains a 5-minute TTL (`CACHE_TTL`). When the wallet is locked, the cache is completely purged to ensure zero address retention in memory.
 - **Pass-Through Fallback:** If an input string is not a `.lez` domain, the resolver transparently treats it as a raw 32-byte account address.
+- **Pre-Flight Transfer Guard:** `propose_native_transfer` proactively resolves `.lez` destinations; if the name is unregistered on-chain or lacks a public receiving account, it fails early with `SdkError::NameResolutionError` before transaction proposal creation.
 
 ### 4.8 Crash-Safe Atomic Persistence (`store.rs`)
 
@@ -460,6 +476,9 @@ To fulfill on-chain adoption verification, verifiable attribution, and automated
 | **Typo-Induced Wallet Lockout** | Mandatory two-step password confirmation prompt before initial storage derivation. | `cli/src/main.rs` |
 | **Accidental Storage Overwrite** | Guard checks pre-existing files; requires explicit `--force` flag before re-initializing existing directories. | `cli/src/main.rs` |
 | **False Success on Empty Directory** | `ensure_wallet_exists` enforces storage verification prior to executing wallet/account operations. | `cli/src/main.rs` |
+| **Keystore Authentication Bypass on Unlock** | Verifies passphrases against encrypted storage file on disk via `wallet::storage::Storage::from_path`, preventing unauthorized state unlocking with arbitrary passwords. | `api.rs` (`unlock`) |
+| **Unregistered LNS Handle Fund Loss** | Pre-flight destination resolution verifies LNS records exist on-chain and hold valid public receiving keys before transaction creation; rejects unresolvable domains immediately. | `api.rs`, `resolve/lns.rs` |
+| **Tampered / Forged LNS Profiles** | Authenticated AES-256-GCM tag verification bound to associated data `logos-names/v5/record`, followed by strict `profile.name == input_name` consistency checking. | `resolve/lns.rs` |
 
 ### 5.2 Privacy Guarantees
 
@@ -479,8 +498,8 @@ Following the project's phased delivery approach, the architecture document refl
 - [x] Calldata instruction decoders for Native, Token, ATA, and Testimonial programs.
 - [x] Pre-execution effect simulator and balance diff projector.
 - [x] Program source verification abstraction conforming to reproducible smart contract registry standards.
-- [x] Token facade with 4-direction transfer matrix (public/private combinations).
-- [x] Clean-room Logos Name Service (LNS) `.lez` resolver with Argon2id and caching.
+- [x] Direct native & token transaction execution pipeline with pre-flight checks, verifier integration, and atomic state transitions.
+- [x] Clean-room Logos Name Service (LNS) `.lez` resolver with Argon2id derivation, live sequencer PDA query, AES-256-GCM profile decryption, and caching.
 - [x] Identity Accountability cryptographic primitives (HKDF derivation, scoped nullifiers, Two-Tier Shamir Secret Sharing over GF($2^8$), BIP-340 Schnorr attestations, and secp256k1 ECDH).
 - [x] Crash-safe atomic store with write-then-rename and `.bak` recovery.
 - [x] Automated CI pipelines for Linux and macOS tracking upstream LEZ `dev`.

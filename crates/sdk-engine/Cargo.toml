@@ -17,6 +17,7 @@ testimonial-program.workspace = true
 
 # Third-party
 argon2.workspace = true
+aes-gcm.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
 bip39.workspace = true
